@@ -1,0 +1,5 @@
+jira:
+  url: https://<JIRA>.atlassian.net/
+  email: <your-email>
+  token: <your-token>
+  
