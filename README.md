@@ -51,23 +51,26 @@ go build ./cmd/wkreport
 
 ### Examples
 
+create alias in .zshrc, .bashrc, etc
+`alias wkreport='~/opt/wkreport/cmd/wkreport.sh'`
+
 ```bash
 # Default terminal table
-./wkreport -f 18205
+wkreport -f 18205
 
 # Tab-separated rows
-./wkreport -f 18205 -tabs > report.tsv
+wkreport -f 18205 -tabs > report.tsv
 
 # Google Docs table (macOS clipboard)
-./wkreport -f 18205 -docs
+wkreport -f 18205 -docs
 
 # Slides bullets grouped by status (macOS clipboard)
-./wkreport -f 18205 -slides
+wkreport -f 18205 -slides
 
 # Clipboard automation examples
-./wkreport -f 18205 -tabs | pbcopy              # reuse TSV elsewhere
-./wkreport -f 18205 -docs | pbcopy -Prefer rtf  # preserve table formatting
-./wkreport -f 18205 -slides | pbcopy -Prefer rtf
+wkreport -f 18205 -tabs | pbcopy              # reuse TSV elsewhere
+wkreport -f 18205 -docs | pbcopy -Prefer rtf  # preserve table formatting
+wkreport -f 18205 -slides | pbcopy -Prefer rtf
 ```
 
 ## Notes on `-docs`
