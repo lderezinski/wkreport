@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -308,44 +309,150 @@ func (c *Client) fetchIssuesFromSearchURL(ctx context.Context, searchURL string)
 		return nil, errors.New("search url is required")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, http.NoBody)
-	if err != nil {
-		return nil, fmt.Errorf("create searchUrl request: %w", err)
-	}
-	req.Header.Set("Authorization", c.authHeader)
-	req.Header.Set("Accept", "application/json")
+	const pageSize = 100
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("execute searchUrl request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		trimmed := strings.TrimSpace(string(body))
-		return nil, fmt.Errorf("jira api error (searchUrl): %s: %s", resp.Status, trimmed)
-	}
-
-	var payload struct {
+	type searchPayloadPage struct {
 		Issues []struct {
 			ID string `json:"id"`
 		} `json:"issues"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode searchUrl response: %w", err)
+		StartAt    int  `json:"startAt"`
+		MaxResults int  `json:"maxResults"`
+		Total      int  `json:"total"`
+		IsLast     bool `json:"isLast"`
+		NextPage   string `json:"nextPage"`
+		NextPageToken string `json:"nextPageToken"`
 	}
 
-	if len(payload.Issues) == 0 {
+	type searchPayload struct {
+		searchPayloadPage
+		Results []searchPayloadPage `json:"results"`
+	}
+
+	searchEndpoint := searchURL
+	baseQuery := url.Values{}
+	useNextPage := false
+	var nextPageToken string
+	if parsed, err := url.Parse(searchURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+		searchEndpoint = fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, parsed.Path)
+		baseQuery = parsed.Query()
+	}
+
+	issueIDs := make([]string, 0)
+	startAt := 0
+
+	var lastPageStartAt = -1
+	var lastPageCount = -1
+	var lastPageFirstID string
+
+	for {
+		requestStartAt := startAt
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchEndpoint, http.NoBody)
+		if err != nil {
+			return nil, fmt.Errorf("create searchUrl request: %w", err)
+		}
+
+		if !useNextPage {
+			q := url.Values{}
+			for key, values := range baseQuery {
+				copied := make([]string, len(values))
+				copy(copied, values)
+				q[key] = copied
+			}
+			if nextPageToken != "" {
+				q.Set("nextPageToken", nextPageToken)
+			} else {
+				q.Set("startAt", strconv.Itoa(requestStartAt))
+			}
+			q.Set("maxResults", strconv.Itoa(pageSize))
+			q.Set("fields", "id")
+			req.URL.RawQuery = q.Encode()
+		}
+
+		req.Header.Set("Authorization", c.authHeader)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("execute searchUrl request: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			trimmed := strings.TrimSpace(string(body))
+			return nil, fmt.Errorf("jira api error (searchUrl): %s: %s", resp.Status, trimmed)
+		}
+
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read searchUrl response: %w", err)
+		}
+		var payload searchPayload
+		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+			return nil, fmt.Errorf("decode searchUrl response: %w", err)
+		}
+
+		page := payload.searchPayloadPage
+		if len(payload.Issues) == 0 && len(payload.Results) > 0 {
+			page = payload.Results[0]
+		}
+
+		pageFirstID := ""
+		if len(page.Issues) > 0 {
+			pageFirstID = strings.TrimSpace(page.Issues[0].ID)
+		}
+
+		logSearchPage(requestStartAt, page.StartAt, len(page.Issues), page.IsLast, page.NextPageToken != "")
+
+		if requestStartAt > 0 && page.StartAt == lastPageStartAt && len(page.Issues) == lastPageCount && pageFirstID == lastPageFirstID {
+			return nil, fmt.Errorf("jira search pagination did not advance (requested startAt=%d, got startAt=%d)", requestStartAt, page.StartAt)
+		}
+
+		for _, ref := range page.Issues {
+			issueID := strings.TrimSpace(ref.ID)
+			if issueID == "" {
+				continue
+			}
+			issueIDs = append(issueIDs, issueID)
+		}
+
+		if page.IsLast || len(page.Issues) == 0 {
+			break
+		}
+
+		nextPage := strings.TrimSpace(page.NextPage)
+		if nextPage != "" {
+			if parsed, err := url.Parse(nextPage); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+				searchEndpoint = nextPage
+				baseQuery = parsed.Query()
+				useNextPage = true
+			} else {
+				return nil, fmt.Errorf("invalid jira nextPage url: %q", nextPage)
+			}
+		} else if token := strings.TrimSpace(page.NextPageToken); token != "" {
+			nextPageToken = token
+			useNextPage = false
+		} else {
+			nextPageToken = ""
+			useNextPage = false
+			startAt += len(page.Issues)
+			if page.Total > 0 && startAt >= page.Total {
+				break
+			}
+		}
+
+		lastPageStartAt = page.StartAt
+		lastPageCount = len(page.Issues)
+		lastPageFirstID = pageFirstID
+	}
+
+	if len(issueIDs) == 0 {
 		return nil, nil
 	}
 
-	issues := make([]Issue, 0, len(payload.Issues))
-	for _, ref := range payload.Issues {
-		issueID := strings.TrimSpace(ref.ID)
-		if issueID == "" {
-			continue
-		}
+	issues := make([]Issue, 0, len(issueIDs))
+	for _, issueID := range issueIDs {
 		issue, err := c.fetchIssueDetails(ctx, issueID)
 		if err != nil {
 			return nil, fmt.Errorf("fetch issue %s: %w", issueID, err)
@@ -430,6 +537,21 @@ func logFilterResponse(filterID int, body []byte) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "jira filter response (filter=%d):\n%s\n", filterID, string(body))
+}
+
+func logSearchPage(requestStartAt, startAt, count int, isLast bool, hasNextPageToken bool) {
+	if !debugEnabled() {
+		return
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"jira search page: requestedStartAt=%d startAt=%d count=%d isLast=%t nextPageToken=%t\n",
+		requestStartAt,
+		startAt,
+		count,
+		isLast,
+		hasNextPageToken,
+	)
 }
 
 func formatResolved(resolutionDate, resolutionName string) string {
